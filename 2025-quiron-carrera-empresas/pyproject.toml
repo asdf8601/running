@@ -7,9 +7,11 @@ dependencies = [
     "aiohttp>=3.9",
     "backoff>=2.2",
     "beautifulsoup4>=4.12",
+    "marimo>=0.18.4",
+    "matplotlib>=3.10.8",
     "pandas>=2.0",
     "pyarrow>=14.0",
 ]
 
-[tool.uv]
-dev-dependencies = []
+[dependency-groups]
+dev = []

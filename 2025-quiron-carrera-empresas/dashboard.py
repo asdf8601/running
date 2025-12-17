@@ -4,9 +4,20 @@ Dashboard for Carrera de las Empresas 2025 with pace metrics and filters.
 """
 
 import json
+import unicodedata
 from pathlib import Path
 
 import pandas as pd
+
+
+def normalize_name(s):
+    """Normalize name for matching: remove accents, uppercase, strip."""
+    if pd.isna(s):
+        return ""
+    s = unicodedata.normalize("NFD", str(s))
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    return s.upper().strip()
+
 
 # Load data
 df = pd.read_parquet("data/clasificaciones_2025.parquet")
@@ -14,14 +25,59 @@ df = pd.read_parquet("data/clasificaciones_2025.parquet")
 # Filter only individual runners (absoluta + autonomos)
 df_individual = df[df["categoria"].isin(["absoluta", "autonomos"])].copy()
 
+# Remove duplicates (same runner appearing multiple times)
+df_individual = df_individual.drop_duplicates(
+    subset=["nombre", "empresa", "distancia", "tiempo"], keep="first"
+)
+
 # Calculate pace (ritmo) in min/km
 df_individual["distancia_km"] = df_individual["distancia"].map({"5K": 5, "10K": 10})
 df_individual["ritmo_min_km"] = (
     df_individual["tiempo_segundos"] / 60 / df_individual["distancia_km"]
 )
 
+# Crear columnas _new con propuesta de etiqueta corregida
+df_individual["tiempo_min"] = df_individual["tiempo_segundos"] / 60
+df_individual["distancia_new"] = df_individual["distancia"]
+
+# Corrección 1: 10K con tiempo < 40 min (ritmo < 4 min/km) -> probablemente son 5K
+mask_rapidos_10k = (df_individual["distancia"] == "10K") & (
+    df_individual["tiempo_min"] < 40
+)
+df_individual.loc[mask_rapidos_10k, "distancia_new"] = "5K"
+
+# Corrección 2: 5K con tiempo > 60 min (ritmo > 12 min/km) -> probablemente son 10K
+mask_lentos_5k = (df_individual["distancia"] == "5K") & (
+    df_individual["tiempo_min"] > 60
+)
+df_individual.loc[mask_lentos_5k, "distancia_new"] = "10K"
+df_individual["distancia_km_new"] = df_individual["distancia_new"].map(
+    {"5K": 5, "10K": 10}
+)
+df_individual["ritmo_new"] = (
+    df_individual["tiempo_min"] / df_individual["distancia_km_new"]
+)
+
 # Filter equipos data
 df_equipos = df[df["categoria"].str.startswith("equipos")].copy()
+
+# Associate individual runners with their teams
+df_individual["nombre_norm"] = df_individual["nombre"].apply(normalize_name)
+df_equipos["nombre_norm"] = df_equipos["nombre"].apply(normalize_name)
+
+# Get unique runner-team associations (one per runner) including num_corredores
+equipo_info = df_equipos[
+    ["nombre_norm", "nombre_equipo", "num_corredores"]
+].drop_duplicates()
+equipo_info = equipo_info.drop_duplicates(subset="nombre_norm", keep="first")
+equipo_info = equipo_info.rename(
+    columns={"nombre_equipo": "equipo", "num_corredores": "equipo_tipo"}
+)
+
+# Merge to get team for each individual runner
+df_individual = df_individual.merge(equipo_info, on="nombre_norm", how="left")
+df_individual["equipo"] = df_individual["equipo"].fillna("")
+df_individual["equipo_tipo"] = df_individual["equipo_tipo"].fillna(0).astype(int)
 
 
 # Calculate team pace - use tiempo_acumulado converted to seconds
@@ -45,8 +101,31 @@ df_equipos["tiempo_acum_seg"] = df_equipos["tiempo_acumulado"].apply(
     tiempo_acumulado_a_segundos
 )
 df_equipos["distancia_km"] = df_equipos["distancia"].map({"5K": 5, "10K": 10})
+# Ritmo por corredor = tiempo_acumulado / num_corredores / distancia
+# Esto hace el ritmo comparable con los ritmos individuales
 df_equipos["ritmo_equipo"] = (
-    df_equipos["tiempo_acum_seg"] / 60 / df_equipos["distancia_km"]
+    df_equipos["tiempo_acum_seg"]
+    / 60
+    / df_equipos["num_corredores"]
+    / df_equipos["distancia_km"]
+)
+
+# Crear columnas _new para equipos
+df_equipos["tiempo_acum_min"] = df_equipos["tiempo_acum_seg"] / 60
+df_equipos["distancia_new"] = df_equipos["distancia"]
+
+# Corrección: 10K con ritmo/corredor < 4 min/km -> probablemente son 5K
+mask_rapidos_equipos = (df_equipos["distancia"] == "10K") & (
+    df_equipos["ritmo_equipo"] < 4
+)
+df_equipos.loc[mask_rapidos_equipos, "distancia_new"] = "5K"
+
+# (No hay 5K lentos cuando se calcula ritmo por corredor correctamente)
+df_equipos["distancia_km_new"] = df_equipos["distancia_new"].map({"5K": 5, "10K": 10})
+df_equipos["ritmo_equipo_new"] = (
+    df_equipos["tiempo_acum_min"]
+    / df_equipos["num_corredores"]
+    / df_equipos["distancia_km_new"]
 )
 
 # Get unique teams (one row per team)
@@ -54,42 +133,32 @@ df_equipos_unique = df_equipos.drop_duplicates(
     subset=["nombre_equipo", "categoria", "distancia", "sexo"]
 )
 
-# Pace by equipos category
-equipos_pace = (
-    df_equipos_unique.groupby(["categoria", "distancia", "sexo"])
-    .agg(
-        ritmo_medio=("ritmo_equipo", "mean"),
-        ritmo_mediana=("ritmo_equipo", "median"),
-        count=("ritmo_equipo", "count"),
-    )
-    .reset_index()
-)
-equipos_pace["ritmo_medio"] = equipos_pace["ritmo_medio"].round(2)
-equipos_pace["ritmo_mediana"] = equipos_pace["ritmo_mediana"].round(2)
-equipos_pace["num_corredores"] = (
-    equipos_pace["categoria"].str.extract(r"(\d)").astype(int)
-)
-
 # Equipos data for filtering (one row per team with stats)
 equipos_data = (
     df_equipos_unique[
         [
+            "puesto",
             "nombre_equipo",
             "empresa",
             "categoria",
             "distancia",
+            "distancia_new",
+            "distancia_km",
+            "distancia_km_new",
             "sexo",
+            "num_corredores",
             "tiempo_acumulado",
             "tiempo_acum_seg",
+            "tiempo_acum_min",
             "ritmo_equipo",
-            "puesto",
-            "num_corredores",
+            "ritmo_equipo_new",
         ]
     ]
     .dropna()
     .copy()
 )
 equipos_data["ritmo_equipo"] = equipos_data["ritmo_equipo"].round(2)
+equipos_data["ritmo_equipo_new"] = equipos_data["ritmo_equipo_new"].round(2)
 equipos_data = equipos_data.to_dict("records")
 
 # Prepare data for charts
@@ -97,323 +166,30 @@ equipos_data = equipos_data.to_dict("records")
 runner_data = (
     df_individual[
         [
+            "puesto",
             "nombre",
             "empresa",
+            "equipo",
+            "equipo_tipo",
             "tiempo",
             "tiempo_segundos",
-            "distancia",
-            "sexo",
+            "tiempo_min",
             "categoria",
+            "distancia",
+            "distancia_new",
+            "distancia_km",
+            "distancia_km_new",
+            "sexo",
             "ritmo_min_km",
-            "puesto",
+            "ritmo_new",
         ]
     ]
-    .dropna()
+    .dropna(subset=["ritmo_min_km"])
     .to_dict("records")
 )
 
-# 2. Pace by sex
-pace_by_sex = (
-    df_individual.groupby(["sexo", "distancia"])
-    .agg(
-        ritmo_medio=("ritmo_min_km", "mean"),
-        ritmo_mediana=("ritmo_min_km", "median"),
-        count=("ritmo_min_km", "count"),
-    )
-    .reset_index()
-)
-pace_by_sex["ritmo_medio"] = pace_by_sex["ritmo_medio"].round(2)
-pace_by_sex["ritmo_mediana"] = pace_by_sex["ritmo_mediana"].round(2)
-
-# 3. All empresa stats (for comparison chart)
-all_empresa_stats = (
-    df_individual.groupby(["empresa", "sexo", "distancia"])
-    .agg(
-        ritmo_medio=("ritmo_min_km", "mean"),
-        ritmo_mediana=("ritmo_min_km", "median"),
-        count=("ritmo_min_km", "count"),
-        mejor_tiempo=("tiempo_segundos", "min"),
-    )
-    .reset_index()
-)
-all_empresa_stats["ritmo_medio"] = all_empresa_stats["ritmo_medio"].round(2)
-all_empresa_stats["ritmo_mediana"] = all_empresa_stats["ritmo_mediana"].round(2)
-
-# 4. Pace by empresa, sexo, distancia (top 15 by best pace per group)
-empresa_stats = all_empresa_stats.copy()
-# Get top 15 per sexo+distancia combination by best pace
-empresa_stats_list = []
-for (sexo, dist), group in empresa_stats.groupby(["sexo", "distancia"]):
-    top15 = group.nsmallest(15, "ritmo_medio")
-    empresa_stats_list.append(top15)
-empresa_stats = pd.concat(empresa_stats_list, ignore_index=True)
-empresa_stats["ritmo_medio"] = empresa_stats["ritmo_medio"].round(2)
-empresa_stats["ritmo_mediana"] = empresa_stats["ritmo_mediana"].round(2)
-
-# 4. Pace distribution data
-pace_dist = df_individual[["ritmo_min_km", "distancia", "sexo"]].dropna()
-
-# 5. All empresas for autocomplete
+# 2. All empresas for autocomplete
 all_empresas = sorted(df_individual["empresa"].unique().tolist())
-
-# Vega-Lite specs
-pace_by_sex_spec = {
-    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-    "title": "Ritmo Medio por Sexo y Distancia",
-    "width": 300,
-    "height": 200,
-    "data": {"values": pace_by_sex.to_dict("records")},
-    "mark": {"type": "bar", "cornerRadiusEnd": 4},
-    "encoding": {
-        "x": {
-            "field": "sexo",
-            "type": "nominal",
-            "title": "Sexo",
-            "axis": {"labelAngle": 0},
-        },
-        "y": {
-            "field": "ritmo_medio",
-            "type": "quantitative",
-            "title": "Ritmo (min/km)",
-        },
-        "color": {"field": "distancia", "type": "nominal", "title": "Distancia"},
-        "xOffset": {"field": "distancia", "type": "nominal"},
-        "tooltip": [
-            {"field": "sexo", "title": "Sexo"},
-            {"field": "distancia", "title": "Distancia"},
-            {"field": "ritmo_medio", "title": "Ritmo Medio (min/km)"},
-            {"field": "ritmo_mediana", "title": "Ritmo Mediana (min/km)"},
-            {"field": "count", "title": "Corredores"},
-        ],
-    },
-}
-
-
-# Create separate specs for each sexo+distancia combination
-def make_empresa_spec(data, sexo_label, distancia_label):
-    sexo_name = "Masculino" if sexo_label == "M" else "Femenino"
-    return {
-        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-        "title": f"Ritmo Empresas - {distancia_label} {sexo_name}",
-        "width": 350,
-        "height": 300,
-        "data": {"values": data},
-        "mark": {"type": "bar", "cornerRadiusEnd": 4},
-        "encoding": {
-            "y": {
-                "field": "empresa",
-                "type": "nominal",
-                "sort": {"field": "ritmo_medio", "order": "ascending"},
-                "title": None,
-            },
-            "x": {
-                "field": "ritmo_medio",
-                "type": "quantitative",
-                "title": "Ritmo (min/km)",
-            },
-            "color": {
-                "field": "ritmo_medio",
-                "type": "quantitative",
-                "scale": {
-                    "scheme": "redyellowgreen",
-                    "reverse": True,
-                    "domain": [4, 9],
-                },
-                "legend": None,
-            },
-            "tooltip": [
-                {"field": "empresa", "title": "Empresa"},
-                {"field": "ritmo_medio", "title": "Ritmo Medio"},
-                {"field": "ritmo_mediana", "title": "Ritmo Mediana"},
-                {"field": "count", "title": "Corredores"},
-            ],
-        },
-    }
-
-
-pace_empresa_5k_m = make_empresa_spec(
-    empresa_stats[
-        (empresa_stats["sexo"] == "M") & (empresa_stats["distancia"] == "5K")
-    ].to_dict("records"),
-    "M",
-    "5K",
-)
-pace_empresa_5k_f = make_empresa_spec(
-    empresa_stats[
-        (empresa_stats["sexo"] == "F") & (empresa_stats["distancia"] == "5K")
-    ].to_dict("records"),
-    "F",
-    "5K",
-)
-pace_empresa_10k_m = make_empresa_spec(
-    empresa_stats[
-        (empresa_stats["sexo"] == "M") & (empresa_stats["distancia"] == "10K")
-    ].to_dict("records"),
-    "M",
-    "10K",
-)
-pace_empresa_10k_f = make_empresa_spec(
-    empresa_stats[
-        (empresa_stats["sexo"] == "F") & (empresa_stats["distancia"] == "10K")
-    ].to_dict("records"),
-    "F",
-    "10K",
-)
-
-# Top 15 equipos by best pace per sexo+distancia
-equipos_top_stats = (
-    df_equipos_unique[["nombre_equipo", "empresa", "distancia", "sexo", "ritmo_equipo"]]
-    .dropna()
-    .copy()
-)
-equipos_top_list = []
-for (sexo, dist), group in equipos_top_stats.groupby(["sexo", "distancia"]):
-    top15 = group.nsmallest(15, "ritmo_equipo")
-    equipos_top_list.append(top15)
-equipos_top_stats = pd.concat(equipos_top_list, ignore_index=True)
-equipos_top_stats["ritmo_equipo"] = equipos_top_stats["ritmo_equipo"].round(2)
-
-
-def make_equipo_spec(data, sexo_label, distancia_label):
-    sexo_name = (
-        "Masculino"
-        if sexo_label == "M"
-        else ("Femenino" if sexo_label == "F" else "Mixto")
-    )
-    return {
-        "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-        "title": f"Ritmo Equipos - {distancia_label} {sexo_name}",
-        "width": 350,
-        "height": 300,
-        "data": {"values": data},
-        "mark": {"type": "bar", "cornerRadiusEnd": 4},
-        "encoding": {
-            "y": {
-                "field": "nombre_equipo",
-                "type": "nominal",
-                "sort": {"field": "ritmo_equipo", "order": "ascending"},
-                "title": None,
-            },
-            "x": {
-                "field": "ritmo_equipo",
-                "type": "quantitative",
-                "title": "Ritmo (min/km)",
-            },
-            "color": {
-                "field": "ritmo_equipo",
-                "type": "quantitative",
-                "scale": {
-                    "scheme": "redyellowgreen",
-                    "reverse": True,
-                    "domain": [4, 9],
-                },
-                "legend": None,
-            },
-            "tooltip": [
-                {"field": "nombre_equipo", "title": "Equipo"},
-                {"field": "empresa", "title": "Empresa"},
-                {"field": "ritmo_equipo", "title": "Ritmo"},
-            ],
-        },
-    }
-
-
-pace_equipo_5k_m = make_equipo_spec(
-    equipos_top_stats[
-        (equipos_top_stats["sexo"] == "M") & (equipos_top_stats["distancia"] == "5K")
-    ].to_dict("records"),
-    "M",
-    "5K",
-)
-pace_equipo_5k_f = make_equipo_spec(
-    equipos_top_stats[
-        (equipos_top_stats["sexo"] == "F") & (equipos_top_stats["distancia"] == "5K")
-    ].to_dict("records"),
-    "F",
-    "5K",
-)
-pace_equipo_5k_x = make_equipo_spec(
-    equipos_top_stats[
-        (equipos_top_stats["sexo"] == "X") & (equipos_top_stats["distancia"] == "5K")
-    ].to_dict("records"),
-    "X",
-    "5K",
-)
-pace_equipo_10k_m = make_equipo_spec(
-    equipos_top_stats[
-        (equipos_top_stats["sexo"] == "M") & (equipos_top_stats["distancia"] == "10K")
-    ].to_dict("records"),
-    "M",
-    "10K",
-)
-pace_equipo_10k_f = make_equipo_spec(
-    equipos_top_stats[
-        (equipos_top_stats["sexo"] == "F") & (equipos_top_stats["distancia"] == "10K")
-    ].to_dict("records"),
-    "F",
-    "10K",
-)
-pace_equipo_10k_x = make_equipo_spec(
-    equipos_top_stats[
-        (equipos_top_stats["sexo"] == "X") & (equipos_top_stats["distancia"] == "10K")
-    ].to_dict("records"),
-    "X",
-    "10K",
-)
-
-pace_histogram_spec = {
-    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-    "title": "Distribución de Ritmos",
-    "width": 280,
-    "height": 200,
-    "data": {"values": pace_dist.to_dict("records")},
-    "mark": "bar",
-    "encoding": {
-        "x": {
-            "bin": {"maxbins": 30, "extent": [3, 12]},
-            "field": "ritmo_min_km",
-            "type": "quantitative",
-            "title": "Ritmo (min/km)",
-        },
-        "y": {"aggregate": "count", "type": "quantitative", "title": "Corredores"},
-        "color": {"field": "distancia", "type": "nominal", "title": "Distancia"},
-        "column": {"field": "sexo", "type": "nominal", "title": "Sexo"},
-    },
-}
-
-# Equipos pace chart
-equipos_pace_spec = {
-    "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-    "title": "Ritmo Medio por Equipos",
-    "width": 400,
-    "height": 250,
-    "data": {"values": equipos_pace.to_dict("records")},
-    "mark": {"type": "bar", "cornerRadiusEnd": 4},
-    "encoding": {
-        "x": {
-            "field": "num_corredores",
-            "type": "ordinal",
-            "title": "Corredores por Equipo",
-            "axis": {"labelAngle": 0},
-        },
-        "y": {
-            "field": "ritmo_medio",
-            "type": "quantitative",
-            "title": "Ritmo Medio (min/km)",
-        },
-        "color": {"field": "distancia", "type": "nominal", "title": "Distancia"},
-        "xOffset": {"field": "distancia", "type": "nominal"},
-        "row": {"field": "sexo", "type": "nominal", "title": "Sexo"},
-        "tooltip": [
-            {"field": "categoria", "title": "Categoría"},
-            {"field": "distancia", "title": "Distancia"},
-            {"field": "sexo", "title": "Sexo"},
-            {"field": "ritmo_medio", "title": "Ritmo Medio (min/km)"},
-            {"field": "ritmo_mediana", "title": "Ritmo Mediana (min/km)"},
-            {"field": "count", "title": "Equipos"},
-        ],
-    },
-}
 
 # Generate HTML dashboard
 html_template = """<!DOCTYPE html>
@@ -586,50 +362,6 @@ html_template = """<!DOCTYPE html>
         </div>
     </div>
 
-    <h2>Métricas de Ritmo</h2>
-    <div class="charts">
-        <div class="chart-container" id="paceBySex"></div>
-        <div class="chart-container" id="paceHistogram"></div>
-    </div>
-    
-    <h2>Comparar Empresa vs Global</h2>
-    <div class="filters" style="margin-bottom: 1rem;">
-        <div class="filter-row">
-            <div class="filter-group">
-                <label for="compareEmpresa">Empresa a comparar</label>
-                <input type="text" id="compareEmpresa" list="empresaListCompare" placeholder="Nombre de empresa..." value="SEEDTAG ADVERTISING SL">
-                <datalist id="empresaListCompare">
-                    ALL_EMPRESAS_OPTIONS
-                </datalist>
-            </div>
-            <button onclick="updateComparison()">Comparar</button>
-        </div>
-    </div>
-    <div class="charts">
-        <div class="chart-container" id="compareChart5k"></div>
-        <div class="chart-container" id="compareChart10k"></div>
-    </div>
-    
-    <h2>Ritmo por Empresa</h2>
-    <p style="color: #666; margin-bottom: 1rem;">Top 15 empresas por mejor ritmo</p>
-    <div class="charts">
-        <div class="chart-container" id="paceEmpresa5kM"></div>
-        <div class="chart-container" id="paceEmpresa10kM"></div>
-        <div class="chart-container" id="paceEmpresa5kF"></div>
-        <div class="chart-container" id="paceEmpresa10kF"></div>
-    </div>
-    
-    <h2>Ritmo por Equipos</h2>
-    <p style="color: #666; margin-bottom: 1rem;">Top 15 equipos por mejor ritmo</p>
-    <div class="charts">
-        <div class="chart-container" id="paceEquipo5kM"></div>
-        <div class="chart-container" id="paceEquipo10kM"></div>
-        <div class="chart-container" id="paceEquipo5kF"></div>
-        <div class="chart-container" id="paceEquipo10kF"></div>
-        <div class="chart-container" id="paceEquipo5kX"></div>
-        <div class="chart-container" id="paceEquipo10kX"></div>
-    </div>
-
     <h2>Búsqueda de Corredores</h2>
     <div class="filters">
         <div class="filter-row">
@@ -645,6 +377,10 @@ html_template = """<!DOCTYPE html>
                 </datalist>
             </div>
             <div class="filter-group">
+                <label for="searchEquipo">Equipo</label>
+                <input type="text" id="searchEquipo" placeholder="Nombre del equipo...">
+            </div>
+            <div class="filter-group">
                 <label for="filterDistancia">Distancia</label>
                 <select id="filterDistancia">
                     <option value="">Todas</option>
@@ -653,11 +389,37 @@ html_template = """<!DOCTYPE html>
                 </select>
             </div>
             <div class="filter-group">
+                <label for="filterDistanciaNew">Dist. Corregida</label>
+                <select id="filterDistanciaNew">
+                    <option value="">Todas</option>
+                    <option value="5K">5K</option>
+                    <option value="10K">10K</option>
+                    <option value="changed">Solo cambiadas</option>
+                </select>
+            </div>
+            <div class="filter-group">
                 <label for="filterSexo">Sexo</label>
                 <select id="filterSexo">
                     <option value="">Todos</option>
                     <option value="M">Masculino</option>
                     <option value="F">Femenino</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label for="filterHasEquipo">En Equipo</label>
+                <select id="filterHasEquipo">
+                    <option value="">Todos</option>
+                    <option value="yes">Con equipo</option>
+                    <option value="no">Sin equipo</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label for="filterEquipoTipo">Tipo Equipo</label>
+                <select id="filterEquipoTipo">
+                    <option value="">Todos</option>
+                    <option value="2">2 corredores</option>
+                    <option value="3">3 corredores</option>
+                    <option value="4">4 corredores</option>
                 </select>
             </div>
             <button onclick="applyFilters()">Buscar</button>
@@ -674,13 +436,19 @@ html_template = """<!DOCTYPE html>
                 <thead>
                     <tr>
                         <th class="numeric">#</th>
-                        <th class="numeric">Puesto General</th>
+                        <th class="numeric">Puesto</th>
                         <th>Nombre</th>
                         <th>Empresa</th>
-                        <th>Distancia</th>
+                        <th>Equipo</th>
+                        <th class="numeric">Tipo</th>
+                        <th>Categoría</th>
                         <th>Sexo</th>
+                        <th>Distancia</th>
+                        <th>Dist. Corregida</th>
                         <th class="numeric">Tiempo</th>
+                        <th class="numeric">Tiempo (min)</th>
                         <th class="numeric">Ritmo (min/km)</th>
+                        <th class="numeric">Ritmo Corregido</th>
                     </tr>
                 </thead>
                 <tbody id="resultsBody"></tbody>
@@ -701,6 +469,15 @@ html_template = """<!DOCTYPE html>
                     <option value="">Todas</option>
                     <option value="5K">5K</option>
                     <option value="10K">10K</option>
+                </select>
+            </div>
+            <div class="filter-group">
+                <label for="filterEquipoDistanciaNew">Dist. Corregida</label>
+                <select id="filterEquipoDistanciaNew">
+                    <option value="">Todas</option>
+                    <option value="5K">5K</option>
+                    <option value="10K">10K</option>
+                    <option value="changed">Solo cambiadas</option>
                 </select>
             </div>
             <div class="filter-group">
@@ -738,11 +515,16 @@ html_template = """<!DOCTYPE html>
                         <th class="numeric">Puesto</th>
                         <th>Nombre Equipo</th>
                         <th>Empresa</th>
-                        <th>Distancia</th>
+                        <th>Categoría</th>
                         <th>Tipo</th>
                         <th class="numeric">Corredores</th>
+                        <th>Distancia</th>
+                        <th>Dist. Corregida</th>
                         <th class="numeric">Tiempo Acumulado</th>
+                        <th class="numeric">Tiempo (min)</th>
                         <th class="numeric">Ritmo (min/km)</th>
+                        <th class="numeric">Ritmo Corregido</th>
+                    </tr>
                     </tr>
                 </thead>
                 <tbody id="equiposResultsBody"></tbody>
@@ -755,130 +537,6 @@ html_template = """<!DOCTYPE html>
         const runnerData = RUNNER_DATA;
         const equiposData = EQUIPOS_DATA;
         const allEmpresas = ALL_EMPRESAS;
-        
-        // Vega specs
-        const paceBySexSpec = PACE_BY_SEX_SPEC;
-        const paceHistogramSpec = PACE_HISTOGRAM_SPEC;
-        const paceEmpresa5kMSpec = PACE_EMPRESA_5K_M_SPEC;
-        const paceEmpresa5kFSpec = PACE_EMPRESA_5K_F_SPEC;
-        const paceEmpresa10kMSpec = PACE_EMPRESA_10K_M_SPEC;
-        const paceEmpresa10kFSpec = PACE_EMPRESA_10K_F_SPEC;
-        const paceEquipo5kMSpec = PACE_EQUIPO_5K_M_SPEC;
-        const paceEquipo5kFSpec = PACE_EQUIPO_5K_F_SPEC;
-        const paceEquipo5kXSpec = PACE_EQUIPO_5K_X_SPEC;
-        const paceEquipo10kMSpec = PACE_EQUIPO_10K_M_SPEC;
-        const paceEquipo10kFSpec = PACE_EQUIPO_10K_F_SPEC;
-        const paceEquipo10kXSpec = PACE_EQUIPO_10K_X_SPEC;
-        
-        // Global stats and empresa stats for comparison
-        const globalStats = GLOBAL_STATS;
-        const allEmpresaStats = ALL_EMPRESA_STATS;
-        
-        // Render charts
-        vegaEmbed('#paceBySex', paceBySexSpec, {actions: false});
-        vegaEmbed('#paceHistogram', paceHistogramSpec, {actions: false});
-        vegaEmbed('#paceEmpresa5kM', paceEmpresa5kMSpec, {actions: false});
-        vegaEmbed('#paceEmpresa5kF', paceEmpresa5kFSpec, {actions: false});
-        vegaEmbed('#paceEmpresa10kM', paceEmpresa10kMSpec, {actions: false});
-        vegaEmbed('#paceEmpresa10kF', paceEmpresa10kFSpec, {actions: false});
-        vegaEmbed('#paceEquipo5kM', paceEquipo5kMSpec, {actions: false});
-        vegaEmbed('#paceEquipo5kF', paceEquipo5kFSpec, {actions: false});
-        vegaEmbed('#paceEquipo5kX', paceEquipo5kXSpec, {actions: false});
-        vegaEmbed('#paceEquipo10kM', paceEquipo10kMSpec, {actions: false});
-        vegaEmbed('#paceEquipo10kF', paceEquipo10kFSpec, {actions: false});
-        vegaEmbed('#paceEquipo10kX', paceEquipo10kXSpec, {actions: false});
-        
-        // Comparison chart function
-        function updateComparison() {
-            const empresaName = document.getElementById('compareEmpresa').value.toUpperCase();
-            
-            // Build comparison data for 5K
-            const data5k = [];
-            ['M', 'F'].forEach(sexo => {
-                const global = globalStats.find(g => g.sexo === sexo && g.distancia === '5K');
-                const empresa = allEmpresaStats.find(e => 
-                    e.empresa.toUpperCase() === empresaName && e.sexo === sexo && e.distancia === '5K'
-                );
-                if (global) {
-                    data5k.push({
-                        grupo: sexo === 'M' ? 'Masculino' : 'Femenino',
-                        tipo: 'Global',
-                        ritmo: global.ritmo_medio,
-                        count: global.count
-                    });
-                }
-                if (empresa) {
-                    data5k.push({
-                        grupo: sexo === 'M' ? 'Masculino' : 'Femenino',
-                        tipo: empresaName,
-                        ritmo: empresa.ritmo_medio,
-                        count: empresa.count
-                    });
-                }
-            });
-            
-            // Build comparison data for 10K
-            const data10k = [];
-            ['M', 'F'].forEach(sexo => {
-                const global = globalStats.find(g => g.sexo === sexo && g.distancia === '10K');
-                const empresa = allEmpresaStats.find(e => 
-                    e.empresa.toUpperCase() === empresaName && e.sexo === sexo && e.distancia === '10K'
-                );
-                if (global) {
-                    data10k.push({
-                        grupo: sexo === 'M' ? 'Masculino' : 'Femenino',
-                        tipo: 'Global',
-                        ritmo: global.ritmo_medio,
-                        count: global.count
-                    });
-                }
-                if (empresa) {
-                    data10k.push({
-                        grupo: sexo === 'M' ? 'Masculino' : 'Femenino',
-                        tipo: empresaName,
-                        ritmo: empresa.ritmo_medio,
-                        count: empresa.count
-                    });
-                }
-            });
-            
-            const makeCompareSpec = (data, title) => ({
-                "$schema": "https://vega.github.io/schema/vega-lite/v5.json",
-                "title": title,
-                "width": 300,
-                "height": 200,
-                "data": {"values": data},
-                "mark": {"type": "bar", "cornerRadiusEnd": 4},
-                "encoding": {
-                    "x": {"field": "grupo", "type": "nominal", "title": null, "axis": {"labelAngle": 0}},
-                    "y": {"field": "ritmo", "type": "quantitative", "title": "Ritmo (min/km)", "scale": {"zero": false}},
-                    "xOffset": {"field": "tipo", "type": "nominal"},
-                    "color": {
-                        "field": "tipo", 
-                        "type": "nominal", 
-                        "title": "Comparación",
-                        "scale": {"range": ["#94a3b8", "#2563eb"]}
-                    },
-                    "tooltip": [
-                        {"field": "tipo", "title": "Grupo"},
-                        {"field": "grupo", "title": "Sexo"},
-                        {"field": "ritmo", "title": "Ritmo (min/km)"},
-                        {"field": "count", "title": "Corredores"}
-                    ]
-                }
-            });
-            
-            vegaEmbed('#compareChart5k', makeCompareSpec(data5k, 'Comparación 5K'), {actions: false});
-            vegaEmbed('#compareChart10k', makeCompareSpec(data10k, 'Comparación 10K'), {actions: false});
-        }
-        
-        // Initial comparison
-        document.addEventListener('DOMContentLoaded', updateComparison);
-        
-        // Enter key triggers comparison
-        document.getElementById('compareEmpresa').addEventListener('keypress', e => {
-            if (e.key === 'Enter') updateComparison();
-        });
         
         // Filter functions
         function formatRitmo(r) {
@@ -924,17 +582,27 @@ html_template = """<!DOCTYPE html>
         function applyFilters() {
             const searchRunner = document.getElementById('searchRunner').value.toLowerCase();
             const searchEmpresa = document.getElementById('searchEmpresa').value.toLowerCase();
+            const searchEquipo = document.getElementById('searchEquipo').value.toLowerCase();
             const filterDistancia = document.getElementById('filterDistancia').value;
+            const filterDistanciaNew = document.getElementById('filterDistanciaNew').value;
             const filterSexo = document.getElementById('filterSexo').value;
+            const filterHasEquipo = document.getElementById('filterHasEquipo').value;
+            const filterEquipoTipo = document.getElementById('filterEquipoTipo').value;
             
             // Check if any filter is active
-            const hasFilters = searchRunner || searchEmpresa || filterDistancia || filterSexo;
+            const hasFilters = searchRunner || searchEmpresa || searchEquipo || filterDistancia || filterDistanciaNew || filterSexo || filterHasEquipo || filterEquipoTipo;
             
             let filtered = runnerData.filter(r => {
                 if (searchRunner && !r.nombre.toLowerCase().includes(searchRunner)) return false;
                 if (searchEmpresa && !r.empresa.toLowerCase().includes(searchEmpresa)) return false;
+                if (searchEquipo && (!r.equipo || !r.equipo.toLowerCase().includes(searchEquipo))) return false;
                 if (filterDistancia && r.distancia !== filterDistancia) return false;
+                if (filterDistanciaNew === 'changed' && r.distancia === r.distancia_new) return false;
+                if (filterDistanciaNew && filterDistanciaNew !== 'changed' && r.distancia_new !== filterDistanciaNew) return false;
                 if (filterSexo && r.sexo !== filterSexo) return false;
+                if (filterHasEquipo === 'yes' && !r.equipo) return false;
+                if (filterHasEquipo === 'no' && r.equipo) return false;
+                if (filterEquipoTipo && r.equipo_tipo !== parseInt(filterEquipoTipo)) return false;
                 return true;
             });
             
@@ -974,8 +642,8 @@ html_template = """<!DOCTYPE html>
             // Sort by ritmo (pace)
             filtered.sort((a, b) => a.ritmo_min_km - b.ritmo_min_km);
             
-            // Limit results: 20 if no filters, 500 otherwise
-            const limit = hasFilters ? 500 : 20;
+            // Limit results: 20 if no filters, 2000 otherwise
+            const limit = hasFilters ? 2000 : 20;
             const limited = filtered.slice(0, limit);
             
             // Update count
@@ -986,25 +654,38 @@ html_template = """<!DOCTYPE html>
             
             // Render table
             const tbody = document.getElementById('resultsBody');
-            tbody.innerHTML = limited.map((r, index) => `
-                <tr>
+            tbody.innerHTML = limited.map((r, index) => {
+                const changed = r.distancia !== r.distancia_new;
+                const highlightClass = changed ? ' class="highlight"' : '';
+                return `
+                <tr${highlightClass}>
                     <td class="numeric">${index + 1}</td>
                     <td class="numeric">${r.puesto}</td>
                     <td>${r.nombre}</td>
                     <td>${r.empresa}</td>
-                    <td><span class="badge badge-${r.distancia.toLowerCase()}">${r.distancia}</span></td>
+                    <td>${r.equipo || '-'}</td>
+                    <td class="numeric">${r.equipo_tipo || '-'}</td>
+                    <td>${r.categoria}</td>
                     <td><span class="badge badge-${r.sexo.toLowerCase()}">${r.sexo === 'M' ? 'Masc' : 'Fem'}</span></td>
+                    <td><span class="badge badge-${r.distancia.toLowerCase()}">${r.distancia}</span></td>
+                    <td><span class="badge badge-${r.distancia_new.toLowerCase()}">${r.distancia_new}</span></td>
                     <td class="numeric">${r.tiempo}</td>
+                    <td class="numeric">${r.tiempo_min.toFixed(2)}</td>
                     <td class="numeric">${r.ritmo_min_km.toFixed(2)}</td>
+                    <td class="numeric">${r.ritmo_new.toFixed(2)}</td>
                 </tr>
-            `).join('');
+            `}).join('');
         }
         
         function clearFilters() {
             document.getElementById('searchRunner').value = '';
             document.getElementById('searchEmpresa').value = '';
+            document.getElementById('searchEquipo').value = '';
             document.getElementById('filterDistancia').value = '';
+            document.getElementById('filterDistanciaNew').value = '';
             document.getElementById('filterSexo').value = '';
+            document.getElementById('filterHasEquipo').value = '';
+            document.getElementById('filterEquipoTipo').value = '';
             applyFilters(); // Show top 20 after clearing
         }
         
@@ -1012,15 +693,18 @@ html_template = """<!DOCTYPE html>
         function applyEquipoFilters() {
             const searchNombre = document.getElementById('searchEquipoNombre').value.toLowerCase();
             const filterDistancia = document.getElementById('filterEquipoDistancia').value;
+            const filterDistanciaNew = document.getElementById('filterEquipoDistanciaNew').value;
             const filterSexo = document.getElementById('filterEquipoSexo').value;
             const filterNum = document.getElementById('filterEquipoNum').value;
             
             // Check if any filter is active
-            const hasFilters = searchNombre || filterDistancia || filterSexo || filterNum;
+            const hasFilters = searchNombre || filterDistancia || filterDistanciaNew || filterSexo || filterNum;
             
             let filtered = equiposData.filter(e => {
                 if (searchNombre && !e.nombre_equipo.toLowerCase().includes(searchNombre) && !e.empresa.toLowerCase().includes(searchNombre)) return false;
                 if (filterDistancia && e.distancia !== filterDistancia) return false;
+                if (filterDistanciaNew === 'changed' && e.distancia === e.distancia_new) return false;
+                if (filterDistanciaNew && filterDistanciaNew !== 'changed' && e.distancia_new !== filterDistanciaNew) return false;
                 if (filterSexo && e.sexo !== filterSexo) return false;
                 if (filterNum && e.num_corredores !== parseInt(filterNum)) return false;
                 return true;
@@ -1061,8 +745,8 @@ html_template = """<!DOCTYPE html>
             // Sort by ritmo (pace)
             filtered.sort((a, b) => a.ritmo_equipo - b.ritmo_equipo);
             
-            // Limit results: 20 if no filters, 500 otherwise
-            const limit = hasFilters ? 500 : 20;
+            // Limit results: 20 if no filters, 2000 otherwise
+            const limit = hasFilters ? 2000 : 20;
             const limited = filtered.slice(0, limit);
             
             // Update count
@@ -1074,24 +758,32 @@ html_template = """<!DOCTYPE html>
             // Render table
             const tbody = document.getElementById('equiposResultsBody');
             const sexoLabels = {'M': 'Masc', 'F': 'Fem', 'X': 'Mixto'};
-            tbody.innerHTML = limited.map((e, index) => `
-                <tr>
+            tbody.innerHTML = limited.map((e, index) => {
+                const changed = e.distancia !== e.distancia_new;
+                const highlightClass = changed ? ' class="highlight"' : '';
+                return `
+                <tr${highlightClass}>
                     <td class="numeric">${index + 1}</td>
                     <td class="numeric">${e.puesto}</td>
                     <td>${e.nombre_equipo}</td>
                     <td>${e.empresa}</td>
-                    <td><span class="badge badge-${e.distancia.toLowerCase()}">${e.distancia}</span></td>
+                    <td>${e.categoria}</td>
                     <td><span class="badge badge-${e.sexo.toLowerCase()}">${sexoLabels[e.sexo] || e.sexo}</span></td>
                     <td class="numeric">${e.num_corredores}</td>
+                    <td><span class="badge badge-${e.distancia.toLowerCase()}">${e.distancia}</span></td>
+                    <td><span class="badge badge-${e.distancia_new.toLowerCase()}">${e.distancia_new}</span></td>
                     <td class="numeric">${e.tiempo_acumulado}</td>
+                    <td class="numeric">${e.tiempo_acum_min.toFixed(2)}</td>
                     <td class="numeric">${e.ritmo_equipo.toFixed(2)}</td>
+                    <td class="numeric">${e.ritmo_equipo_new.toFixed(2)}</td>
                 </tr>
-            `).join('');
+            `}).join('');
         }
         
         function clearEquipoFilters() {
             document.getElementById('searchEquipoNombre').value = '';
             document.getElementById('filterEquipoDistancia').value = '';
+            document.getElementById('filterEquipoDistanciaNew').value = '';
             document.getElementById('filterEquipoSexo').value = '';
             document.getElementById('filterEquipoNum').value = '';
             applyEquipoFilters();
@@ -1119,8 +811,9 @@ total_individual = len(df_individual)
 total_equipos = df[df["categoria"].str.startswith("equipos")]["nombre_equipo"].nunique()
 total_empresas = df_individual["empresa"].nunique()
 
-ritmo_5k = df_individual[df_individual["distancia"] == "5K"]["ritmo_min_km"].mean()
-ritmo_10k = df_individual[df_individual["distancia"] == "10K"]["ritmo_min_km"].mean()
+# Usar ritmo_new y distancia_new para las métricas corregidas
+ritmo_5k = df_individual[df_individual["distancia_new"] == "5K"]["ritmo_new"].mean()
+ritmo_10k = df_individual[df_individual["distancia_new"] == "10K"]["ritmo_new"].mean()
 
 
 def format_ritmo(r):
@@ -1142,22 +835,6 @@ html = html.replace("RUNNER_DATA", json.dumps(runner_data))
 html = html.replace("EQUIPOS_DATA", json.dumps(equipos_data))
 html = html.replace("ALL_EMPRESAS", json.dumps(all_empresas))
 html = html.replace("ALL_EMPRESAS_OPTIONS", empresas_options)
-html = html.replace("PACE_BY_SEX_SPEC", json.dumps(pace_by_sex_spec))
-html = html.replace("PACE_HISTOGRAM_SPEC", json.dumps(pace_histogram_spec))
-html = html.replace("PACE_EMPRESA_5K_M_SPEC", json.dumps(pace_empresa_5k_m))
-html = html.replace("PACE_EMPRESA_5K_F_SPEC", json.dumps(pace_empresa_5k_f))
-html = html.replace("PACE_EMPRESA_10K_M_SPEC", json.dumps(pace_empresa_10k_m))
-html = html.replace("PACE_EMPRESA_10K_F_SPEC", json.dumps(pace_empresa_10k_f))
-html = html.replace("PACE_EQUIPO_5K_M_SPEC", json.dumps(pace_equipo_5k_m))
-html = html.replace("PACE_EQUIPO_5K_F_SPEC", json.dumps(pace_equipo_5k_f))
-html = html.replace("PACE_EQUIPO_5K_X_SPEC", json.dumps(pace_equipo_5k_x))
-html = html.replace("PACE_EQUIPO_10K_M_SPEC", json.dumps(pace_equipo_10k_m))
-html = html.replace("PACE_EQUIPO_10K_F_SPEC", json.dumps(pace_equipo_10k_f))
-html = html.replace("PACE_EQUIPO_10K_X_SPEC", json.dumps(pace_equipo_10k_x))
-html = html.replace("GLOBAL_STATS", json.dumps(pace_by_sex.to_dict("records")))
-html = html.replace(
-    "ALL_EMPRESA_STATS", json.dumps(all_empresa_stats.to_dict("records"))
-)
 
 # Save dashboard
 output_path = Path("dashboard.html")
